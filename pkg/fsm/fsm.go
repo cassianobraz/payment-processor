@@ -70,8 +70,8 @@ func (m *Machine[T]) Terminal(states ...State) *Machine[T] {
 
 // FallbackTo registers a deterministic escape hatch. When the handler of
 // state returns an error, the machine moves to target instead of aborting.
-func (m *Machine[T]) FallbackTo(states State, target State) *Machine[T] {
-	m.fallbacks[target] = states
+func (m *Machine[T]) FallbackTo(state State, target State) *Machine[T] {
+	m.fallbacks[state] = target
 	return m
 }
 
@@ -100,16 +100,17 @@ func (m *Machine[T]) Run(ctx context.Context, data *T) ([]Transition, error) {
 			Err:      err,
 		}
 
-		trace = append(trace, hop)
-
 		if err != nil {
 			fallback, hasFallback := m.fallbacks[current]
 			if !hasFallback {
 				trace = append(trace, hop)
+				return trace, fmt.Errorf("fsm: handler %q: %w", current, err)
 			}
 			hop.To = fallback
 			next = fallback
 		}
+
+		trace = append(trace, hop)
 
 		if m.terminals[next] {
 			return trace, nil
