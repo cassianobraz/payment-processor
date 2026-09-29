@@ -56,20 +56,98 @@ func (b *Batcher[In, Out]) Submit(ctx context.Context, item In) (Out, error) {
 	var zero Out
 
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	if b.closed {
+		b.mu.Unlock()
 		return zero, ErrClosed
-
 	}
 
-	req := request[In, Out]{items: item, resp: make(chan result[Out])}
+	// resp is buffered so the loop never blocks if the caller gave up on ctx.
+	req := request[In, Out]{items: item, resp: make(chan result[Out], 1)}
 	b.queue <- req
+	b.mu.Unlock()
 
 	select {
 	case res := <-req.resp:
 		return res.value, res.err
 	case <-ctx.Done():
 		return zero, ctx.Err()
+	}
+}
+
+func (b *Batcher[In, Out]) Close() {
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return
+	}
+	b.closed = true
+	close(b.queue)
+	b.mu.Unlock()
+
+	b.wg.Wait()
+}
+
+func (b *Batcher[In, Out]) dispatch(batch []request[In, Out]) {
+	items := make([]In, len(batch))
+	for i, req := range batch {
+		items[i] = req.items
+	}
+
+	outs, err := b.flush(context.Background(), items)
+	if err != nil && len(outs) != len(batch) {
+		err = errors.New("batcher: flusher returned wrong number of results")
+	}
+
+	for i, req := range batch {
+		if err != nil {
+			var zero Out
+			req.resp <- result[Out]{err: err, value: zero}
+			continue
+		}
+		req.resp <- result[Out]{err: nil, value: outs[i]}
+	}
+}
+
+func (b *Batcher[In, Out]) Loop() {
+	defer b.wg.Done()
+
+	pending := make([]request[In, Out], 0, b.maxSize)
+	timer := time.NewTimer(b.maxWait)
+	defer timer.Stop()
+
+	flushPending := func() {
+		if len(pending) == 0 {
+			return
+		}
+		batch := pending
+		pending = make([]request[In, Out], 0, b.maxSize)
+		b.dispatch(batch)
+	}
+
+	for {
+		select {
+		case req, ok := <-b.queue:
+			if !ok {
+				flushPending()
+				return
+			}
+
+			pending = append(pending, req)
+			if len(pending) == 1 {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(b.maxWait)
+			}
+
+			if len(pending) == b.maxSize {
+				flushPending()
+			}
+		case <-timer.C:
+			flushPending()
+		}
 	}
 }
